@@ -7,8 +7,9 @@
   * в радиусе 10 км нет заводов, складов, промзон, предприятий и военных объектов.
 
 Только стандартная библиотека Python 3.8+. Запуск:
+  python3 search.py             # пробный запуск: только OSM, 0 запросов к RIA
   export RIA_API_KEY=...        # ключ developers.ria.com
-  python3 search.py             # см. --help для порогов
+  python3 search.py --go        # реальный поиск, не больше --max-requests запросов
 Результат: results.csv, results.html (карта), cache/ (ответы API).
 """
 import argparse
@@ -101,37 +102,88 @@ def cached_json(name, fetch):
         json.dump(obj, f, ensure_ascii=False)
     return obj
 
-# ---------- DIM.RIA ----------
+# ---------- DIM.RIA (лимит запросов!) ----------
 
-def ria_search_ids(key, args):
-    """Все id объявлений по фильтру (Киевская обл., дома, продажа)."""
+class Budget:
+    """Счётчик реальных запросов к DIM.RIA, хранится в cache/ria_budget.json между запусками.
+    Ответы кешируются навсегда, поэтому один и тот же запрос никогда не оплачивается дважды."""
+
+    def __init__(self, limit):
+        self.path = os.path.join(CACHE, "ria_budget.json")
+        self.limit = limit
+        self.total = limit
+        self.used = 0
+        if os.path.exists(self.path):
+            with open(self.path, encoding="utf-8") as f:
+                self.used = json.load(f).get("used", 0)
+
+    def left(self):
+        return max(0, self.limit - self.used)
+
+    def spend(self):
+        if self.used >= self.limit:
+            raise BudgetExceeded()
+        self.used += 1
+        os.makedirs(CACHE, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"used": self.used, "limit": self.total}, f)
+
+
+class BudgetExceeded(Exception):
+    pass
+
+
+def ria_get(key, budget, name, path, params, delay):
+    def fetch():
+        budget.spend()
+        time.sleep(delay)
+        url = "%s/%s?%s" % (RIA_BASE, path, urllib.parse.urlencode([("api_key", key)] + params))
+        print("  [RIA %d/%d] %s" % (budget.used, budget.total, path), file=sys.stderr)
+        return http_get(url)
+    return cached_json(name, fetch)
+
+
+def ria_cities(key, budget, args):
+    """Список населённых пунктов области: 1 запрос."""
+    res = ria_get(key, budget, "cities_%d.json" % args.state_id, "cities/%d" % args.state_id,
+                  [("lang_id", 4)], args.delay)
+    out = {}
+    for c in res if isinstance(res, list) else res.get("items", []):
+        cid = c.get("cityID") or c.get("city_id") or c.get("value") or c.get("id")
+        for k in ("name", "name_uk", "name_ru", "nameUk", "nameRu"):
+            if c.get(k) and cid:
+                out.setdefault(norm_name(c[k]), int(cid))
+    return out
+
+
+def ria_search_ids(key, budget, args, city_id):
+    """id объявлений (дома, продажа, цена <= max) в одном населённом пункте. 1 запрос на страницу."""
     ids, page = [], 0
     while True:
         params = [
-            ("api_key", key), ("category", args.category), ("operation_type", 1),
-            ("state_id", args.state_id), ("page", page),
-            # цена до N в USD (как в URL фильтров dim.ria.com); дополнительно проверяется локально
+            ("category", args.category), ("operation_type", 1), ("state_id", args.state_id),
+            ("city_id", city_id), ("page", page),
+            # цена до N в USD (как в фильтрах dim.ria.com); дополнительно проверяется локально
             ("characteristic[234][to]", args.max_price), ("characteristic[242]", 239),
-        ]
-        params += [("realty_type", t) for t in args.realty_types]
-        url = RIA_BASE + "/search?" + urllib.parse.urlencode(params)
-        res = cached_json("search_p%d.json" % page, lambda: http_get(url))
+        ] + [("realty_type", t) for t in args.realty_types]
+        res = ria_get(key, budget, "search_c%d_p%d.json" % (city_id, page), "search", params, args.delay)
         items = res.get("items") or []
         ids.extend(items)
-        total = int(res.get("count") or 0)
-        print("  страница %d: +%d (всего %d из %d)" % (page, len(items), len(ids), total), file=sys.stderr)
-        if not items or len(ids) >= total:
-            return list(dict.fromkeys(ids))
+        if not items or len(ids) >= int(res.get("count") or 0) or page + 1 >= args.max_pages:
+            return list(dict.fromkeys(ids)), int(res.get("count") or len(ids))
         page += 1
-        time.sleep(args.delay)
 
 
-def ria_info(key, rid, delay):
-    path = os.path.join(CACHE, "info_%s.json" % rid)
-    if not os.path.exists(path):
-        time.sleep(delay)
-    return cached_json("info_%s.json" % rid,
-                       lambda: http_get("%s/info/%s?%s" % (RIA_BASE, rid, urllib.parse.urlencode({"api_key": key, "lang_id": 4}))))
+def ria_info(key, budget, rid, args):
+    return ria_get(key, budget, "info_%s.json" % rid, "info/%s" % rid, [("lang_id", 4)], args.delay)
+
+
+def norm_name(s):
+    s = s.lower().replace("’", "'").replace("ʼ", "'").replace("`", "'").replace("ё", "е").strip()
+    for p in ("смт ", "с. ", "м. ", "с.", "м.", "село ", "селище "):
+        if s.startswith(p):
+            s = s[len(p):].strip()
+    return s.split(" (")[0]
 
 
 def _num(v):
@@ -174,12 +226,15 @@ OVERPASS_QUERY = """
   nwr["man_made"="works"]({bbox});
   nwr["industrial"]({bbox});
   way["building"~"^(industrial|warehouse|factory)$"]({bbox});
+  node["place"~"^(city|town|village|hamlet)$"]({bbox});
 );
 out geom;
 """
 
 
 def classify(tags):
+    if tags.get("place"):
+        return "place"
     a, hc, shop = tags.get("amenity"), tags.get("healthcare"), tags.get("shop")
     if a in ("hospital", "clinic", "doctors") or hc in ("hospital", "clinic", "centre", "doctor"):
         return "medical"
@@ -270,6 +325,18 @@ L.circle([%f,%f],{radius:30000,fill:false}).addTo(m);
         f.write(page)
 
 
+def check_point(pt, by, bad, args, hazard_km=None):
+    res, problems = {}, []
+    for k, name in (("medical", "больница"), ("pharmacy", "аптека"), ("shop", "магазин")):
+        res[k] = nearest(pt, by[k], args.amenity_km)
+        if not res[k]:
+            problems.append("нет: %s ≤%g км" % (name, args.amenity_km))
+    hazard = nearest(pt, bad, args.clear_km if hazard_km is None else hazard_km)
+    if hazard:
+        problems.append("рядом %s: %s — %.1f км" % (hazard[1]["kind"], label(hazard[1]), hazard[0]))
+    return res, hazard, problems
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--radius", type=float, default=30, help="радиус поиска от Боярки, км (30)")
@@ -278,37 +345,25 @@ def main():
     ap.add_argument("--clear-km", type=float, default=10, help="нет промзон/складов/военных в радиусе, км (10)")
     ap.add_argument("--min-industrial-ha", type=float, default=0,
                     help="игнорировать промзоны меньше N га (0 = учитывать все)")
+    ap.add_argument("--village-slack-km", type=float, default=2,
+                    help="допуск при оценке сёл по центру: дом может стоять в N км от центра (2)")
+    ap.add_argument("--budget", type=int, default=100, help="ВСЕГО запросов к DIM.RIA за все запуски (100)")
+    ap.add_argument("--max-requests", type=int, default=40,
+                    help="максимум запросов к DIM.RIA за этот запуск (40)")
+    ap.add_argument("--max-pages", type=int, default=1, help="страниц поиска на населённый пункт (1)")
+    ap.add_argument("--max-places", type=int, default=15, help="сколько лучших сёл/городов опрашивать (15)")
+    ap.add_argument("--go", action="store_true",
+                    help="реально тратить запросы к DIM.RIA (без флага — только план по OSM, 0 запросов)")
     ap.add_argument("--category", type=int, default=4, help="категория DIM.RIA (4 = дома)")
     ap.add_argument("--realty-types", type=int, nargs="+", default=[5, 6],
                     help="типы DIM.RIA (5 = дом, 6 = часть дома, 7 = дача)")
     ap.add_argument("--state-id", type=int, default=10, help="область DIM.RIA (10 = Киевская)")
-    ap.add_argument("--delay", type=float, default=0.4, help="пауза между запросами к API, сек")
+    ap.add_argument("--delay", type=float, default=1.0, help="пауза между запросами к API, сек")
     ap.add_argument("--out", default=os.path.join(HERE, "results"))
     args = ap.parse_args()
 
-    key = os.environ.get("RIA_API_KEY")
-    if not key:
-        sys.exit("Задайте ключ: export RIA_API_KEY=...")
-
-    print("1/3 DIM.RIA: поиск объявлений...", file=sys.stderr)
-    ids = ria_search_ids(key, args)
-    listings = []
-    for i, rid in enumerate(ids, 1):
-        try:
-            l = parse_listing(ria_info(key, rid, args.delay))
-        except Exception as e:
-            print("  %s: ошибка %s" % (rid, e), file=sys.stderr)
-            continue
-        if i % 50 == 0:
-            print("  подробности %d/%d" % (i, len(ids)), file=sys.stderr)
-        if l["price_usd"] is None or l["price_usd"] > args.max_price or not l["lat"] or not l["lon"]:
-            continue
-        l["dist_boyarka_km"] = haversine_km(BOYARKA, (l["lat"], l["lon"]))
-        if l["dist_boyarka_km"] <= args.radius:
-            listings.append(l)
-    print("  подходит по цене и радиусу: %d" % len(listings), file=sys.stderr)
-
-    print("2/3 OpenStreetMap: инфраструктура и промзоны...", file=sys.stderr)
+    # 1. OpenStreetMap — бесплатно, делаем первым, чтобы не тратить запросы RIA впустую
+    print("1/4 OpenStreetMap: инфраструктура, промзоны, населённые пункты...", file=sys.stderr)
     feats = osm_features(int(math.ceil(args.radius + args.clear_km + 1)))
     by = {k: [f for f in feats if f["kind"] == k] for k in ("medical", "pharmacy", "shop")}
     bad = [f for f in feats if f["kind"] in ("industrial", "warehouse", "military")]
@@ -322,19 +377,82 @@ def main():
     print("  медицина %d, аптеки %d, магазины %d, пром/склад/военные %d" % (
         len(by["medical"]), len(by["pharmacy"]), len(by["shop"]), len(bad)), file=sys.stderr)
 
-    print("3/3 Проверка критериев...", file=sys.stderr)
+    # 2. Оценка населённых пунктов по центру (с допуском) — какие вообще имеет смысл искать
+    places = []
+    for f in feats:
+        if f["kind"] != "place" or not f["name"]:
+            continue
+        d = haversine_km(BOYARKA, f["center"])
+        if d > args.radius:
+            continue
+        _, hazard, problems = check_point(f["center"], by, bad, args,
+                                          hazard_km=max(0.5, args.clear_km - args.village_slack_km))
+        # ближайшее «вредное» — для сортировки: чем дальше, тем лучше
+        hz = nearest(f["center"], bad, args.clear_km + 20)
+        places.append({"name": f["name"], "names": [f["tags"].get(k) for k in ("name", "name:uk", "name:ru") if f["tags"].get(k)],
+                       "dist": d, "ok": not problems, "problems": problems, "hazard_km": hz[0] if hz else 99,
+                       "center": f["center"]})
+    good = sorted([p for p in places if p["ok"]], key=lambda p: -p["hazard_km"])
+    print("2/4 Населённых пунктов в радиусе %g км: %d, проходят критерии: %d" % (args.radius, len(places), len(good)),
+          file=sys.stderr)
+    for p in good[:args.max_places]:
+        print("   + %-25s %4.1f км от Боярки, до промзоны %.1f км" % (p["name"], p["dist"], p["hazard_km"]), file=sys.stderr)
+    if not good:
+        near = sorted(places, key=lambda p: -p["hazard_km"])[:10]
+        print("  Ни один пункт не проходит. Лучшие по удалённости от промзон:", file=sys.stderr)
+        for p in near:
+            print("   - %-25s до промзоны %.1f км; %s" % (p["name"], p["hazard_km"], "; ".join(p["problems"])), file=sys.stderr)
+        print("  Ослабьте критерии (--clear-km 5 или --min-industrial-ha 5). Запросы RIA не тратились.", file=sys.stderr)
+        return
+
+    targets = good[:args.max_places]
+    budget = Budget(args.budget)
+    need = 1 + len(targets) * args.max_pages
+    print("  План: 1 запрос (список пунктов) + до %d поисков + подробности по найденным домам." % (need - 1),
+          file=sys.stderr)
+    print("  Бюджет RIA: использовано %d из %d, на этот запуск разрешено %d." % (
+        budget.used, budget.limit, min(budget.left(), args.max_requests)), file=sys.stderr)
+    if not args.go:
+        print("\nЭто пробный запуск (0 запросов к DIM.RIA). Для реального поиска добавьте --go.")
+        return
+    key = os.environ.get("RIA_API_KEY")
+    if not key:
+        sys.exit("Задайте ключ: export RIA_API_KEY=...")
+    run_limit = budget.used + min(budget.left(), args.max_requests)
+    budget.limit = min(budget.limit, run_limit)
+
+    listings = []
+    try:
+        # 3. Поиск только в подходящих населённых пунктах
+        print("3/4 DIM.RIA: поиск в подходящих пунктах...", file=sys.stderr)
+        cities = ria_cities(key, budget, args)
+        all_ids = []
+        for p in targets:
+            cid = next((cities[norm_name(n)] for n in p["names"] if norm_name(n) in cities), None)
+            if cid is None:
+                print("   ? %s — нет в справочнике RIA, пропуск" % p["name"], file=sys.stderr)
+                continue
+            ids, total = ria_search_ids(key, budget, args, cid)
+            print("   %s: объявлений %d" % (p["name"], total), file=sys.stderr)
+            all_ids.extend(ids)
+        all_ids = list(dict.fromkeys(all_ids))
+        # 4. Подробности (координаты, цена) — сколько позволяет бюджет
+        print("4/4 DIM.RIA: подробности по %d объявлениям (осталось запросов: %d)..." % (
+            len(all_ids), budget.left()), file=sys.stderr)
+        for rid in all_ids:
+            l = parse_listing(ria_info(key, budget, rid, args))
+            if l["price_usd"] is None or l["price_usd"] > args.max_price or not l["lat"] or not l["lon"]:
+                continue
+            l["dist_boyarka_km"] = haversine_km(BOYARKA, (l["lat"], l["lon"]))
+            if l["dist_boyarka_km"] <= args.radius:
+                listings.append(l)
+    except BudgetExceeded:
+        print("  ! Лимит запросов этого запуска исчерпан — остальное можно дособрать следующим запуском"
+              " (кеш сохранён, повторно запросы не тратятся).", file=sys.stderr)
+
     rows = []
     for l in listings:
-        pt = (l["lat"], l["lon"])
-        res, problems = {}, []
-        for k, name in (("medical", "больница"), ("pharmacy", "аптека"), ("shop", "магазин")):
-            n = nearest(pt, by[k], args.amenity_km)
-            res[k] = n
-            if not n:
-                problems.append("нет: %s ≤%g км" % (name, args.amenity_km))
-        hazard = nearest(pt, bad, args.clear_km)
-        if hazard:
-            problems.append("рядом %s: %s — %.1f км" % (hazard[1]["kind"], label(hazard[1]), hazard[0]))
+        res, hazard, problems = check_point((l["lat"], l["lon"]), by, bad, args)
         fmt = lambda n: "%.1f км — %s" % (n[0], label(n[1])) if n else ""
         rows.append(dict(l, ok=not problems, verdict="OK" if not problems else "; ".join(problems),
                          medical=fmt(res["medical"]), pharmacy=fmt(res["pharmacy"]), shop=fmt(res["shop"]),
@@ -351,7 +469,8 @@ def main():
     write_html(args.out + ".html", rows)
 
     ok = [r for r in rows if r["ok"]]
-    print("\nПодходят все критерии: %d из %d" % (len(ok), len(rows)))
+    print("\nПодходят все критерии: %d из %d. Запросов RIA израсходовано всего: %d из %d." % (
+        len(ok), len(rows), budget.used, args.budget))
     for r in ok[:30]:
         print("  $%-6d %5.1f км  %s %s\n          %s" % (r["price_usd"], r["dist_boyarka_km"], r["city"], r["street"], r["url"]))
     print("\nФайлы: %s.csv, %s.html" % (args.out, args.out))
